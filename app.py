@@ -273,8 +273,33 @@ def _enrich_so_df(
         merged = merged2
 
     # 必备字段猜测
-    qty_col = _first_existing_col(merged, ["实发数量", "数量"])
-    amount_col = _first_existing_col(merged, ["实发金额", "金额"])
+    # RT：强力候选数量/金额字段（不同模板可能叫法不同）
+    qty_col = _first_existing_col(
+        merged,
+        [
+            "实发数量",
+            "数量",
+            "退货数量",
+            "售后数量",
+            "退款数量",
+            "收货数量",
+            "入库数量",
+        ],
+    )
+    amount_col = _first_existing_col(
+        merged,
+        [
+            "实发金额",
+            "金额",
+            "退货金额",
+            "售后金额",
+            "退款金额",
+            "退款总金额",
+            "实退金额",
+            "含税金额",
+            "价税合计",
+        ],
+    )
     ship_income_col = _first_existing_col(merged, ["运费收入分摊", "运费收入分摊金额", "运费分摊"])
     ship_fee_col = _first_existing_col(merged, ["运费金额", "运费"])
     sku_name_col = _first_existing_col(merged, ["商品简称", "商品名称", "商品描述"])
@@ -476,9 +501,18 @@ def _enrich_rt_df(
     shop_col = _first_existing_col(merged, ["店铺", "店铺名称", "平台店铺"])
     online_order_col = _first_existing_col(merged, ["线上订单号", "客户订单号", "线上订单", "订单号线上", "线上订单编号"])
 
+    if debug:
+        st.write(f"RT字段识别：qty_col={qty_col}, amount_col={amount_col}, ship_income_col={ship_income_col}")
+
     if not qty_col or not amount_col:
         if debug:
-            st.warning(f"RT无法定位金额/数量列：qty_col={qty_col}, amount_col={amount_col}")
+            qty_candidates = [c for c in merged.columns if "数量" in str(c)]
+            amt_candidates = [c for c in merged.columns if ("金额" in str(c) or "价税" in str(c) or "退款" in str(c))]
+            st.warning(
+                f"RT无法定位金额/数量列：qty_col={qty_col}, amount_col={amount_col}"
+            )
+            st.write(f"RT merged 含有数量相关的列名（前20个）: {qty_candidates[:20]}")
+            st.write(f"RT merged 含有金额相关的列名（前20个）: {amt_candidates[:20]}")
         return pd.DataFrame(), pd.DataFrame()
 
     _ensure_numeric(merged, qty_col)
