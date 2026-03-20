@@ -386,7 +386,12 @@ def _enrich_so_df(
     else:
         merged["运费金额"] = 0.0
 
-    return merged[["店铺", "商品编码", "实发数量", "实际支付金额", "运费金额", "线上订单号", "订单号"]].copy()
+    # 异常自动拦截与标记：高亮写入备注列（供报表&异常清单导出）
+    merged["异常备注"] = ""
+    merged.loc[pd.to_numeric(merged["实际支付金额"], errors="coerce").fillna(0) == 0, "异常备注"] += "发货金额为0，请查实际支付金额; "
+    merged.loc[merged["店铺"] == "N/A", "异常备注"] += "未匹配到店铺，请查其他仓库; "
+
+    return merged[["店铺", "商品编码", "实发数量", "实际支付金额", "运费金额", "线上订单号", "订单号", "异常备注"]].copy()
 
 
 def _enrich_rt_df(
@@ -735,8 +740,15 @@ def _enrich_rt_df_strict(
         }
     )
     # 店铺 N/A 兜底：统一填充为天猫，归入天猫报表桶
-    base_out["店铺"] = base_out["店铺"].fillna("天猫")
-    base_out["店铺"] = base_out["店铺"].replace({"N/A": "天猫", "N／A": "天猫", "": "天猫"})
+    base_out["异常备注"] = ""
+    base_out.loc[pd.to_numeric(base_out["实际支付金额"], errors="coerce").fillna(0) == 0, "异常备注"] += "退款金额为0，请查原订单实际支付金额; "
+    base_out.loc[
+        base_out["店铺"].isna() | (base_out["店铺"] == "N/A") | (base_out["店铺"] == ""),
+        "异常备注",
+    ] += "时间差未匹配到店铺，请查聚水潭; "
+
+    # 保持原有的 fillna("天猫") 逻辑不变
+    base_out["店铺"] = base_out["店铺"].fillna("天猫").replace({"N/A": "天猫", "N／A": "天猫", "": "天猫"})
 
     nonbao_df = base_out.loc[base_out["实发数量"] == 0].copy()
     main_df = base_out.loc[base_out["实发数量"] != 0].copy()
@@ -1053,6 +1065,7 @@ def _compute_report_rows(
         unit_incl = float(r["__tax_incl_unit__"])
         unit_excl = float(r["__tax_excl_unit__"])
         client_order = _parse_first_order_id(r.get("线上订单号", ""))
+        remark = str(r.get("异常备注", "")).strip()
 
         cols = [
             main_code,  # 电商系统物料编码
@@ -1070,7 +1083,7 @@ def _compute_report_rows(
             "100%",  # 单品折扣
             "100%",  # 整单折扣
             client_order,  # 客户订单号
-            "",  # 备注
+            remark,  # 备注
             "否",  # 是否赠品
             "",  # 扩展字段1
             "",  # 扩展字段2
@@ -1104,7 +1117,7 @@ def _compute_report_rows(
                 "100%",  # 单品折扣
                 "100%",  # 整单折扣
                 client_order,  # 客户订单号
-                "",  # 备注
+                remark,  # 备注
                 "否",  # 是否赠品
                 "",  # 扩展字段1
                 "",  # 扩展字段2
@@ -1130,7 +1143,7 @@ def _dataframe_to_excel_bytes(
         df = pd.DataFrame()
     df = df.copy()
     # 输出前统一 NaN 处理：字符串列为空，数值列为0
-    for col in ["店铺", "商品编码", "线上订单号", "订单号"]:
+    for col in ["店铺", "商品编码", "线上订单号", "订单号", "异常备注"]:
         if col in df.columns:
             df[col] = df[col].fillna("").astype(str)
     for col in ["实发数量", "实际支付金额"]:
@@ -1623,6 +1636,28 @@ def main() -> None:
             out_files[f"{yesterday_prefix}-rt-手工单.xlsx"] = _dataframe_to_excel_bytes(manual_rt_df, yesterday, aux_map, is_return=True)
         else:
             out_files[f"{yesterday_prefix}-rt-手工单.xlsx"] = _dataframe_to_excel_bytes(pd.DataFrame(), yesterday, aux_map, is_return=True)
+
+        # 异常自动拦截与标记：导出《异常待查清单》给财务人工核对
+        exceptions = []
+        if so_base_df is not None and not so_base_df.empty and "异常备注" in so_base_df.columns:
+            so_exc = so_base_df[so_base_df["异常备注"] != ""].copy()
+            if not so_exc.empty:
+                so_exc.insert(0, "单据类型", "发货(SO)")
+                exceptions.append(so_exc)
+
+        if rt_main_df is not None and not rt_main_df.empty and "异常备注" in rt_main_df.columns:
+            rt_exc = rt_main_df[rt_main_df["异常备注"] != ""].copy()
+            if not rt_exc.empty:
+                rt_exc.insert(0, "单据类型", "退货(RT)")
+                exceptions.append(rt_exc)
+
+        if exceptions:
+            exc_df = pd.concat(exceptions, ignore_index=True)
+            exc_df = exc_df.fillna("")
+            exc_bio = BytesIO()
+            with pd.ExcelWriter(exc_bio, engine="openpyxl") as writer:
+                exc_df.to_excel(writer, index=False, sheet_name="异常待查单")
+            out_files[f"{yesterday_prefix}-异常待查清单(需人工核对).xlsx"] = exc_bio
 
         # ZIP打包
         zip_buf = _zip_bytes(out_files)
