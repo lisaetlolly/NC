@@ -158,6 +158,7 @@ def _enrich_so_df(
     so1_df: pd.DataFrame,
     so2_df: pd.DataFrame,
     aux_map: Dict[str, Tuple[str, str]],
+    debug: bool = False,
 ) -> pd.DataFrame:
     so1_df = _normalize_columns(so1_df)
     so2_df = _normalize_columns(so2_df)
@@ -170,6 +171,8 @@ def _enrich_so_df(
     oms_col = _first_existing_col(so2_df, ["OMS"])
 
     if not key1 or not key2 or not oms_col:
+        if debug:
+            st.warning(f"SO无法定位合并键：key1={key1}, key2={key2}, oms_col={oms_col}")
         return pd.DataFrame()
 
     # Pandas merge 在不同数据类型（object/int/float）上可能触发 ValueError，
@@ -179,6 +182,8 @@ def _enrich_so_df(
 
     # 仅聚水潭发货明细（宽容：contains，避免不可见空格导致等号匹配为空）
     so2_filt = so2_df.loc[so2_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
+    if debug:
+        st.write(f"SO：so1_rows={len(so1_df)}, so2_rows={len(so2_df)}, so2_filt_rows={len(so2_filt)}")
     if so2_filt.empty:
         return pd.DataFrame()
 
@@ -190,6 +195,8 @@ def _enrich_so_df(
         suffixes=("_底1", "_底2"),
     )
     if merged.empty:
+        if debug:
+            st.write("SO：merge后为空（inner join 找不到匹配单号）")
         return pd.DataFrame()
 
     # 必备字段猜测
@@ -204,11 +211,15 @@ def _enrich_so_df(
     online_order_col = _first_existing_col(merged, ["线上订单号", "客户订单号", "线上订单", "订单号线上"])
 
     if not qty_col or not amount_col:
+        if debug:
+            st.warning(f"SO无法定位金额/数量列：qty_col={qty_col}, amount_col={amount_col}")
         return pd.DataFrame()
 
     # 剔除非保仓：实发数量==0 的数据剔除
     _ensure_numeric(merged, qty_col)
     merged = merged.loc[merged[qty_col] != 0].copy()
+    if debug:
+        st.write(f"SO：实发数量!=0后 rows={len(merged)}")
     if merged.empty:
         return pd.DataFrame()
 
@@ -232,6 +243,8 @@ def _enrich_so_df(
     if sku_name_col:
         mask_exclude = _contains_keyword(merged[sku_name_col], SO_EXCLUDE_KEYWORDS)
         merged = merged.loc[~mask_exclude].copy()
+        if debug:
+            st.write(f"SO：剔除商品关键词后 rows={len(merged)}")
     if merged.empty:
         return pd.DataFrame()
 
@@ -303,6 +316,7 @@ def _enrich_rt_df(
     rt3_df: pd.DataFrame,
     rt4_df: pd.DataFrame,
     aux_map: Dict[str, Tuple[str, str]],
+    debug: bool = False,
 ) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """
     返回：(rt_main_df, rt_nonbao_df)
@@ -317,6 +331,8 @@ def _enrich_rt_df(
     after_key = _first_existing_col(rt3_df, ["售后单号", "售后订单号", "单号"])
 
     if not oms_col or not external_key or not after_key:
+        if debug:
+            st.warning(f"RT无法定位合并键：oms_col={oms_col}, external_key={external_key}, after_key={after_key}")
         return pd.DataFrame(), pd.DataFrame()
 
     # 同样对 join key 做类型统一（字符串），避免 merge key dtype 不兼容导致 ValueError
@@ -325,11 +341,15 @@ def _enrich_rt_df(
 
     # 仅聚水潭收货明细（宽容：contains，避免不可见空格导致等号匹配为空）
     rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
+    if debug:
+        st.write(f"RT：rt3_rows={len(rt3_df)}, rt4_rows={len(rt4_df)}, rt4_filt_rows={len(rt4_filt)}")
     if rt4_filt.empty:
         return pd.DataFrame(), pd.DataFrame()
 
     rt4_filt["__THKey__"] = rt4_filt[external_key].apply(_clean_th_key).astype(str).str.strip()
     rt4_filt = rt4_filt.loc[rt4_filt["__THKey__"] != ""].copy()
+    if debug:
+        st.write(f"RT：THKey!=空后 rows={len(rt4_filt)}")
     if rt4_filt.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -341,6 +361,8 @@ def _enrich_rt_df(
         suffixes=("_底3", "_底4"),
     )
     if merged.empty:
+        if debug:
+            st.write("RT：merge后为空（inner join 找不到匹配TH键/售后单号）")
         return pd.DataFrame(), pd.DataFrame()
 
     qty_col = _first_existing_col(merged, ["实发数量", "数量"])
@@ -353,6 +375,8 @@ def _enrich_rt_df(
     online_order_col = _first_existing_col(merged, ["线上订单号", "客户订单号", "线上订单", "订单号线上", "线上订单编号"])
 
     if not qty_col or not amount_col:
+        if debug:
+            st.warning(f"RT无法定位金额/数量列：qty_col={qty_col}, amount_col={amount_col}")
         return pd.DataFrame(), pd.DataFrame()
 
     _ensure_numeric(merged, qty_col)
@@ -371,6 +395,8 @@ def _enrich_rt_df(
     if sku_name_col:
         mask_exclude = _contains_keyword(merged[sku_name_col], SO_EXCLUDE_KEYWORDS)
         merged = merged.loc[~mask_exclude].copy()
+        if debug:
+            st.write(f"RT：剔除商品关键词后 rows={len(merged)}")
     if merged.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -802,6 +828,8 @@ def main() -> None:
     yesterday = date.today() - timedelta(days=1)
     yesterday_prefix = yesterday.strftime("%Y%m%d")
 
+    debug = st.checkbox("显示调试信息（用于定位为什么为0）", value=False)
+
     with st.spinner("正在读取/处理数据，请稍候..."):
         aux_df = _dfs_to_concat(aux_files, "辅助表")
         aux_map = _build_aux_map(aux_df)
@@ -855,15 +883,24 @@ def main() -> None:
             else None
         )
 
+        if debug:
+            st.write("=== Debug：上传文件读取结果 ===")
+            st.write(f"aux_df：{None if aux_df is None else aux_df.shape}, sample_cols={[] if aux_df is None else list(aux_df.columns[:20])}")
+            st.write(f"so1_df：{None if so1_df is None else so1_df.shape}, sample_cols={[] if so1_df is None else list(so1_df.columns[:20])}")
+            st.write(f"so2_df：{None if so2_df is None else so2_df.shape}, sample_cols={[] if so2_df is None else list(so2_df.columns[:20])}")
+            st.write(f"rt3_df：{None if rt3_df is None else rt3_df.shape}, sample_cols={[] if rt3_df is None else list(rt3_df.columns[:20])}")
+            st.write(f"rt4_df：{None if rt4_df is None else rt4_df.shape}, sample_cols={[] if rt4_df is None else list(rt4_df.columns[:20])}")
+            st.write(f"manual_df：{None if manual_df is None else manual_df.shape}, sample_cols={[] if manual_df is None else list(manual_df.columns[:20])}")
+
         so_base_df = pd.DataFrame()
         if so1_df is not None and so2_df is not None:
-            so_base_df = _enrich_so_df(so1_df, so2_df, aux_map=aux_map)
+            so_base_df = _enrich_so_df(so1_df, so2_df, aux_map=aux_map, debug=debug)
         st.write(f"SO匹配后行数：{len(so_base_df)}")
 
         rt_main_df = pd.DataFrame()
         rt_nonbao_df = pd.DataFrame()
         if rt3_df is not None and rt4_df is not None:
-            rt_main_df, rt_nonbao_df = _enrich_rt_df(rt3_df, rt4_df, aux_map=aux_map)
+            rt_main_df, rt_nonbao_df = _enrich_rt_df(rt3_df, rt4_df, aux_map=aux_map, debug=debug)
         st.write(f"RT主退货行数：{len(rt_main_df) if rt_main_df is not None else 0}，RT非保行数：{len(rt_nonbao_df) if rt_nonbao_df is not None else 0}")
 
         # 手工单：尽量按“同格式处理（SO正 RT负）”
