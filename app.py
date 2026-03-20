@@ -28,7 +28,7 @@ SO_EXCLUDE_KEYWORDS = [
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    df.columns = [str(c).strip() for c in df.columns]
+    df.columns = df.columns.astype(str).str.strip()
     return df
 
 
@@ -58,20 +58,64 @@ def _contains_keyword(series: pd.Series, keywords: List[str]) -> pd.Series:
     return series.astype(str).str.contains(pattern, case=False, na=False, regex=True)
 
 
+def _violent_clean_key_series(series: pd.Series) -> pd.Series:
+    """
+    最暴力的 key 清理：strip + 去掉不可见空白 + 去掉 Excel 浮点尾部 .0。
+    """
+    s = series.astype(str)
+    s = s.replace("\u00a0", " ").replace("\u3000", " ")
+    s = s.str.strip()
+    # 去掉尾部 .0（以及 .0...）
+    s = s.str.replace(r"(\d+)\.0+$", r"\1", regex=True)
+    # 再次去掉空格
+    s = s.str.strip()
+    # 统一空值
+    s = s.replace({"nan": "", "NaN": "", "None": ""})
+    return s
+
+
 def _clean_th_key(external_single_no: object) -> str:
-    s = "" if external_single_no is None else str(external_single_no).strip()
+    s = "" if external_single_no is None else str(external_single_no)
+    # 去除不可见空白 + 去掉可能的 .0 尾巴（Excel 常见）
+    s = s.replace("\u00a0", " ").replace("\u3000", " ").strip()
+    s = re.sub(r"(\d+)\.0+$", r"\1", s)
+    s = s.strip()
     if not s:
         return ""
     # TH开头且后接至少11位数字：TH + 11 digits
     if s.startswith("TH"):
         digits = re.sub(r"\D+", "", s[2:])
-        return digits[:11] if len(digits) >= 11 else digits
+        # 取“后续的11位数字”（更宽松：取最后11位，避免前缀/中间补位导致错位）
+        return digits[-11:] if len(digits) >= 11 else digits
     # 其他情况：抓取首次11位连续数字
     m = re.search(r"(\d{11})", s)
     if m:
         return m.group(1)
     digits = re.sub(r"\D+", "", s)
     return digits[-11:] if len(digits) >= 11 else digits
+
+
+def _normalize_merge_key(x: object) -> str:
+    """
+    为 merge 做归一化：
+    1) 转成字符串并 strip
+    2) 提取所有数字并拼接
+    3) 去除前导 0（全是 0 时保留一个 0）
+    """
+    if x is None:
+        return ""
+    s = str(x)
+    s = s.replace("\u00a0", " ").replace("\u3000", " ").strip()
+    # Excel 常把数字写成 12345.0，直接把尾部 .0 去掉，避免误拼出多一位 0
+    s = re.sub(r"(\d+)\.0+$", r"\1", s)
+    if s in {"nan", "NaN", "None"}:
+        return ""
+    s = re.sub(r"\s+", "", s)
+    digits = "".join(re.findall(r"\d+", s))
+    if not digits:
+        return s
+    digits = digits.lstrip("0")
+    return digits if digits != "" else "0"
 
 
 def _parse_first_order_id(x: object) -> str:
@@ -175,15 +219,17 @@ def _enrich_so_df(
             st.warning(f"SO无法定位合并键：key1={key1}, key2={key2}, oms_col={oms_col}")
         return pd.DataFrame()
 
-    # Pandas merge 在不同数据类型（object/int/float）上可能触发 ValueError，
-    # 因此在合并前将 join key 统一转为“去空格字符串”。
-    so1_df[key1] = so1_df[key1].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
-    so2_df[key2] = so2_df[key2].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
+    # Pandas merge 在不同数据类型上可能触发问题，因此在合并前进行“强转+清理”。
+    so1_df[key1] = _violent_clean_key_series(so1_df[key1])
+    so2_df[key2] = _violent_clean_key_series(so2_df[key2])
+    so2_df[oms_col] = _violent_clean_key_series(so2_df[oms_col])
 
-    # 仅聚水潭发货明细（宽容：contains，避免不可见空格导致等号匹配为空）
+    # 仅聚水潭发货明细（宽容：contains）
     so2_filt = so2_df.loc[so2_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
     if debug:
-        st.write(f"SO：so1_rows={len(so1_df)}, so2_rows={len(so2_df)}, so2_filt_rows={len(so2_filt)}")
+        st.write(f"👉 识别到底表1(聚水潭出库)，总行数: {len(so1_df)}")
+        st.write(f"👉 识别到底表2(WMS发货)，总行数: {len(so2_df)}")
+        st.write(f"👉 底表2 过滤聚水潭后，剩余行数: {len(so2_filt)}")
     if so2_filt.empty:
         return pd.DataFrame()
 
@@ -194,10 +240,37 @@ def _enrich_so_df(
         how="inner",
         suffixes=("_底1", "_底2"),
     )
+    if debug:
+        st.write(f"👉 两表 Merge 匹配后，成功合并的行数: {len(merged)}")
     if merged.empty:
         if debug:
-            st.write("SO：merge后为空（inner join 找不到匹配单号）")
-        return pd.DataFrame()
+            st.write("SO：merge后为空（inner join 找不到匹配单号），尝试归一化键二次匹配")
+
+        # 宽松匹配：用“提取数字+去前导0”的归一化键再 merge 一次
+        so1_tmp = so1_df.copy()
+        so2_tmp = so2_filt.copy()
+        so1_tmp["__SOKeyNorm__"] = so1_tmp[key1].map(_normalize_merge_key)
+        so2_tmp["__SOKeyNorm__"] = so2_tmp[key2].map(_normalize_merge_key)
+
+        so1_tmp = so1_tmp.loc[so1_tmp["__SOKeyNorm__"] != ""].copy()
+        so2_tmp = so2_tmp.loc[so2_tmp["__SOKeyNorm__"] != ""].copy()
+
+        if debug:
+            inter = set(so1_tmp["__SOKeyNorm__"].unique()) & set(so2_tmp["__SOKeyNorm__"].unique())
+            st.write(f"SO：归一化键交集数量={len(inter)}")
+
+        merged2 = so1_tmp.merge(
+            so2_tmp,
+            left_on="__SOKeyNorm__",
+            right_on="__SOKeyNorm__",
+            how="inner",
+            suffixes=("_底1", "_底2"),
+        )
+        if merged2.empty:
+            if debug:
+                st.write("SO：归一化 merge 仍为空")
+            return pd.DataFrame()
+        merged = merged2
 
     # 必备字段猜测
     qty_col = _first_existing_col(merged, ["实发数量", "数量"])
@@ -335,14 +408,17 @@ def _enrich_rt_df(
             st.warning(f"RT无法定位合并键：oms_col={oms_col}, external_key={external_key}, after_key={after_key}")
         return pd.DataFrame(), pd.DataFrame()
 
-    # 同样对 join key 做类型统一（字符串），避免 merge key dtype 不兼容导致 ValueError
-    rt3_df[after_key] = rt3_df[after_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
-    rt4_df[external_key] = rt4_df[external_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
+    # 同样在 merge 前对 join key 做强转+清理
+    rt3_df[after_key] = _violent_clean_key_series(rt3_df[after_key])
+    rt4_df[external_key] = _violent_clean_key_series(rt4_df[external_key])
+    rt4_df[oms_col] = _violent_clean_key_series(rt4_df[oms_col])
 
-    # 仅聚水潭收货明细（宽容：contains，避免不可见空格导致等号匹配为空）
+    # 仅聚水潭收货明细（宽容：contains）
     rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
     if debug:
-        st.write(f"RT：rt3_rows={len(rt3_df)}, rt4_rows={len(rt4_df)}, rt4_filt_rows={len(rt4_filt)}")
+        st.write(f"👉 识别到底表3(聚水潭退货)，总行数: {len(rt3_df)}")
+        st.write(f"👉 识别到底表4(WMS收货)，总行数: {len(rt4_df)}")
+        st.write(f"👉 底表4 过滤聚水潭后，剩余行数: {len(rt4_filt)}")
     if rt4_filt.empty:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -360,10 +436,36 @@ def _enrich_rt_df(
         how="inner",
         suffixes=("_底3", "_底4"),
     )
+    if debug:
+        st.write(f"👉 两表 Merge 匹配后，成功合并的行数: {len(merged)}")
     if merged.empty:
         if debug:
             st.write("RT：merge后为空（inner join 找不到匹配TH键/售后单号）")
-        return pd.DataFrame(), pd.DataFrame()
+        # 宽松匹配：用“提取数字+去前导0”的归一化键再 merge 一次
+        rt3_tmp = rt3_df.copy()
+        rt4_tmp = rt4_filt.copy()
+        rt3_tmp["__RTAfKeyNorm__"] = rt3_tmp[after_key].map(_normalize_merge_key)
+        rt4_tmp["__RTTHKeyNorm__"] = rt4_tmp["__THKey__"].map(_normalize_merge_key)
+
+        rt3_tmp = rt3_tmp.loc[rt3_tmp["__RTAfKeyNorm__"] != ""].copy()
+        rt4_tmp = rt4_tmp.loc[rt4_tmp["__RTTHKeyNorm__"] != ""].copy()
+
+        if debug:
+            inter = set(rt3_tmp["__RTAfKeyNorm__"].unique()) & set(rt4_tmp["__RTTHKeyNorm__"].unique())
+            st.write(f"RT：归一化键交集数量={len(inter)}")
+
+        merged2 = rt3_tmp.merge(
+            rt4_tmp,
+            left_on="__RTAfKeyNorm__",
+            right_on="__RTTHKeyNorm__",
+            how="inner",
+            suffixes=("_底3", "_底4"),
+        )
+        if merged2.empty:
+            if debug:
+                st.write("RT：归一化 merge 仍为空")
+            return pd.DataFrame(), pd.DataFrame()
+        merged = merged2
 
     qty_col = _first_existing_col(merged, ["实发数量", "数量"])
     amount_col = _first_existing_col(merged, ["实发金额", "金额"])
@@ -841,7 +943,7 @@ def main() -> None:
             _dfs_to_concat_by_name_keywords(
                 so1_files,
                 "销售底表1",
-                ["底表1", "销售出库", "出库表", "聚水潭出库"],
+                ["销售出库", "底表1", "出库表", "聚水潭出库"],
             )
             if so1_files
             else None
@@ -850,7 +952,7 @@ def main() -> None:
             _dfs_to_concat_by_name_keywords(
                 so2_files,
                 "销售底表2",
-                ["底表2", "发货明细", "WMS发货", "发货", "WMS"],
+                ["发货明细", "发货", "底表2", "WMS发货"],
             )
             if so2_files
             else None
@@ -859,7 +961,7 @@ def main() -> None:
             _dfs_to_concat_by_name_keywords(
                 rt3_files,
                 "退货底表3",
-                ["底表3", "退货", "售后", "聚水潭退货"],
+                ["退货", "底表3", "售后", "聚水潭退货"],
             )
             if rt3_files
             else None
@@ -868,7 +970,7 @@ def main() -> None:
             _dfs_to_concat_by_name_keywords(
                 rt4_files,
                 "退货底表4",
-                ["底表4", "收货明细", "WMS收货", "收货", "WMS"],
+                ["收货明细", "收货", "底表4", "WMS收货"],
             )
             if rt4_files
             else None
@@ -877,7 +979,7 @@ def main() -> None:
             _dfs_to_concat_by_name_keywords(
                 manual_files,
                 "手工单表",
-                ["手工", "手工单", "独立业务"],
+                ["手工", "手工单"],
             )
             if manual_files
             else None
