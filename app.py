@@ -146,44 +146,52 @@ def _shop_bucket(shop: str) -> str:
 
 def _build_aux_map(aux_df: Optional[pd.DataFrame]) -> Dict[str, Tuple[str, str]]:
     """
-    返回：前6位编码 -> (主计量单位, 辅计量单位)
-    不保证辅助表字段名完全一致，因此做容错猜测。
+    返回：完整编码 -> (主计量单位, 辅计量单位)
+    严禁截断前6位，必须以 Full Code/完整编码精确匹配。
     """
     if aux_df is None or aux_df.empty:
         return {}
 
     aux_df = _normalize_columns(aux_df)
 
-    code_col = _first_existing_col(aux_df, ["匹配物料编码", "物料编码", "编码", "物料代码", "电商系统物料编码"])
-    main_unit_col = _first_existing_col(aux_df, ["主计量单位", "主单位", "主计量", "主计量单位编码"])
-    sub_unit_col = _first_existing_col(aux_df, ["辅计量单位", "辅单位", "辅计量", "辅计量单位编码"])
+    code_col = _first_existing_col(
+        aux_df,
+        ["Full Code", "匹配物料编码", "物料编码", "编码", "物料代码", "电商系统物料编码"],
+    )
+    main_unit_col = _first_existing_col(aux_df, ["Unit", "主计量单位", "主单位", "主计量"])
+    sub_unit_col = _first_existing_col(aux_df, ["辅计量单位", "辅单位"])
 
-    # 允许辅助表只有一个单位列时
     if not main_unit_col:
-        main_unit_col = _first_existing_col(aux_df, ["计量单位", "单位"]) or None
+        main_unit_col = _first_existing_col(aux_df, ["计量单位", "单位"])
     if not sub_unit_col:
         sub_unit_col = main_unit_col
 
     if not code_col or not main_unit_col:
         return {}
 
-    _ensure_numeric(aux_df, code_col)
-
     result: Dict[str, Tuple[str, str]] = {}
     for _, r in aux_df.iterrows():
         c = r.get(code_col, "")
         if pd.isna(c):
             continue
-        c_str = str(int(c)) if _is_int_like(c) else str(c).strip()
+        if isinstance(c, float) and float(c).is_integer():
+            c_str = str(int(c))
+        else:
+            c_str = str(c).strip()
         c_str = re.sub(r"\.0+$", "", c_str)
         if not c_str:
             continue
-        prefix6 = c_str[:6]
-        main_u = r.get(main_unit_col, None)
-        sub_u = r.get(sub_unit_col, None) if sub_unit_col else main_u
-        main_u = "PCS" if main_u is None or (isinstance(main_u, float) and np.isnan(main_u)) or str(main_u).strip() == "" else str(main_u).strip()
-        sub_u = main_u if sub_u is None or (isinstance(sub_u, float) and np.isnan(sub_u)) or str(sub_u).strip() == "" else str(sub_u).strip()
-        result[prefix6] = (main_u, sub_u)
+
+        main_u = str(r.get(main_unit_col, "PCS")).strip()
+        sub_u = str(r.get(sub_unit_col, main_u)).strip()
+        if not main_u or main_u.lower() == "nan":
+            main_u = "PCS"
+        if not sub_u or sub_u.lower() == "nan":
+            sub_u = main_u
+
+        # 用完整编码作为 key
+        result[c_str] = (main_u, sub_u)
+
     return result
 
 
@@ -349,24 +357,7 @@ def _enrich_so_df(
             merged.loc[adj_mask, "实际支付金额"] = 0
         merged.drop(columns=["__是否STUDIO9__", "__是否PeachBag__"], errors="ignore", inplace=True)
 
-    # 运费H101切分
-    if ship_fee_col:
-        _ensure_numeric(merged, ship_fee_col)
-        fee_mask = pd.to_numeric(merged[ship_fee_col], errors="coerce").fillna(0) > 0
-        if fee_mask.any():
-            h101_rows = merged.loc[fee_mask].copy()
-            h101_rows[qty_col] = 1
-            h101_rows["运费收入分摊"] = 0
-            h101_rows["实际支付金额"] = pd.to_numeric(h101_rows[ship_fee_col], errors="coerce").fillna(0)
-            # 商品编码切分：写入到“原始商品编码列”，避免后续 rename 覆盖 H101 设置
-            if sku_code_col and sku_code_col in h101_rows.columns:
-                h101_rows[sku_code_col] = "H101"
-            else:
-                h101_rows["商品编码"] = "H101"
-            # 保留并追加
-            merged = pd.concat([merged, h101_rows], ignore_index=True)
-
-    # 输出统一列
+    # 输出统一列（运费行由报表层 H101 生成，这里只保留运费金额字段）
     if not sku_code_col:
         merged["商品编码"] = ""
         sku_code_col = "商品编码"
@@ -389,8 +380,13 @@ def _enrich_so_df(
     if ship_income_col not in merged.columns:
         merged["运费收入分摊"] = 0
 
-    # 不强依赖：后续报表只用“商品编码/实发数量/实际支付金额/线上订单号/店铺/订单号”
-    return merged[["店铺", "商品编码", "实发数量", "实际支付金额", "线上订单号", "订单号"]].copy()
+    # 不强依赖：后续报表只用“商品编码/实发数量/实际支付金额/运费金额/线上订单号/店铺/订单号”
+    if ship_fee_col and ship_fee_col in merged.columns:
+        merged["运费金额"] = pd.to_numeric(merged[ship_fee_col], errors="coerce").fillna(0)
+    else:
+        merged["运费金额"] = 0.0
+
+    return merged[["店铺", "商品编码", "实发数量", "实际支付金额", "运费金额", "线上订单号", "订单号"]].copy()
 
 
 def _enrich_rt_df(
@@ -988,8 +984,12 @@ def _compute_report_rows(
     is_return: bool,
 ) -> List[List[object]]:
     """
-    返回给 openpyxl 的每行数据（不含表头），顺序严格为：
-    [电商系统物料编码, 辅助自由项编码1, 主计量单位, 辅计量单位, 数量, 税率, 价税合计, 无税金额, 税额, 含税单价, 无税单价, 单品折扣, 整单折扣, 客户订单号, 是否赠品, 发货仓库编码]
+    返回给 openpyxl 的每行数据（不含表头），顺序严格为 25 列：
+    [电商系统物料编码, 辅助自由项编码1, 辅助自由项编码2,
+     主计量单位, 辅计量单位,
+     数量, 税率, 含税单价, 无税单价, 税额, 无税金额, 价税合计,
+     单品折扣, 整单折扣,
+     客户订单号, 备注, 是否赠品, 扩展字段1~8, 发货仓库编码]
     """
     if df is None or df.empty:
         return []
@@ -1031,49 +1031,92 @@ def _compute_report_rows(
     for i in range(len(df)):
         r = df.iloc[i]
         item_code = "" if pd.isna(r.get("商品编码", "")) else str(r.get("商品编码", "")).strip()
-        aux_code = ""
+        aux_code1 = ""
+        aux_code2 = ""
         main_code = item_code
         # 严格限制：必须是纯数字的长串，且包含 '00' 才允许切分
         if "00" in item_code and item_code.isdigit() and len(item_code) > 6:
-            aux_code = item_code[6:]
+            aux_code1 = item_code[6:]
             main_code = item_code[:6]
 
-        prefix6 = main_code[:6] if len(main_code) >= 6 else main_code
-        main_u, sub_u = aux_map.get(prefix6, ("PCS", "PCS"))
+        # 使用完整编码查辅助表，查不到再默认 PCS
+        main_u, sub_u = aux_map.get(item_code, ("PCS", "PCS"))
         if not main_u:
             main_u = "PCS"
         if not sub_u:
             sub_u = main_u
 
-        quantity = r["__qty__"]
-        amount_incl = r["__price__"]
-        amount_excl = r["__ex_tax__"]
-        amount_tax = r["__tax__"]
-        unit_incl = r["__tax_incl_unit__"]
-        unit_excl = r["__tax_excl_unit__"]
-
+        quantity = float(r["__qty__"])
+        amount_incl = float(r["__price__"])
+        amount_excl = float(r["__ex_tax__"])
+        amount_tax = float(r["__tax__"])
+        unit_incl = float(r["__tax_incl_unit__"])
+        unit_excl = float(r["__tax_excl_unit__"])
         client_order = _parse_first_order_id(r.get("线上订单号", ""))
 
-        rows.append(
-            [
-                main_code,  # 电商系统物料编码
-                aux_code,  # 辅助自由项编码1
-                main_u,  # 主计量单位
-                sub_u,  # 辅计量单位
-                float(quantity),  # 数量
+        cols = [
+            main_code,  # 电商系统物料编码
+            aux_code1,  # 辅助自由项编码1
+            aux_code2,  # 辅助自由项编码2
+            main_u,  # 主计量单位
+            sub_u,  # 辅计量单位
+            quantity,  # 数量
+            "13.00",  # 税率
+            unit_incl,  # 含税单价
+            unit_excl,  # 无税单价
+            amount_tax,  # 税额
+            amount_excl,  # 无税金额
+            amount_incl,  # 价税合计
+            "100%",  # 单品折扣
+            "100%",  # 整单折扣
+            client_order,  # 客户订单号
+            "",  # 备注
+            "否",  # 是否赠品
+            "",  # 扩展字段1
+            "",  # 扩展字段2
+            "",  # 扩展字段3
+            "",  # 扩展字段4
+            "",  # 扩展字段5
+            "",  # 扩展字段6
+            "",  # 扩展字段7
+            "2107",  # 发货仓库编码（扩展字段8）
+        ]
+        rows.append(cols)
+
+        # 恢复：H101 运费单独成行（仅限发货单）
+        freight_amt = float(r.get("运费金额", 0.0))
+        if (not is_return) and freight_amt > 0:
+            f_ex_tax = round(freight_amt / 1.13, 2)
+            f_tax = round(freight_amt - f_ex_tax, 2)
+            freight_cols = [
+                "H101",  # 电商系统物料编码
+                "",  # 辅助自由项编码1
+                "",  # 辅助自由项编码2
+                "PCS",  # 主计量单位
+                "PCS",  # 辅计量单位
+                1.0,  # 数量
                 "13.00",  # 税率
-                float(amount_incl),  # 价税合计
-                float(amount_excl),  # 无税金额
-                float(amount_tax),  # 税额
-                float(unit_incl),  # 含税单价
-                float(unit_excl),  # 无税单价
+                freight_amt,  # 含税单价（单件即总额）
+                f_ex_tax,  # 无税单价
+                f_tax,  # 税额
+                f_ex_tax,  # 无税金额
+                freight_amt,  # 价税合计
                 "100%",  # 单品折扣
                 "100%",  # 整单折扣
                 client_order,  # 客户订单号
+                "",  # 备注
                 "否",  # 是否赠品
-                "2107",  # 发货仓库编码
+                "",  # 扩展字段1
+                "",  # 扩展字段2
+                "",  # 扩展字段3
+                "",  # 扩展字段4
+                "",  # 扩展字段5
+                "",  # 扩展字段6
+                "",  # 扩展字段7
+                "2107",  # 发货仓库编码（扩展字段8）
             ]
-        )
+            rows.append(freight_cols)
+
     return rows
 
 
@@ -1124,19 +1167,28 @@ def _dataframe_to_excel_bytes(
     body_headers = [
         "电商系统物料编码",
         "辅助自由项编码1",
+        "辅助自由项编码2",
         "主计量单位",
         "辅计量单位",
         "数量",
         "税率",
-        "价税合计",
-        "无税金额",
-        "税额",
         "含税单价",
         "无税单价",
+        "税额",
+        "无税金额",
+        "价税合计",
         "单品折扣",
         "整单折扣",
         "客户订单号",
+        "备注",
         "是否赠品",
+        "扩展字段1",
+        "扩展字段2",
+        "扩展字段3",
+        "扩展字段4",
+        "扩展字段5",
+        "扩展字段6",
+        "扩展字段7",
         "发货仓库编码",
     ]
 
@@ -1150,10 +1202,10 @@ def _dataframe_to_excel_bytes(
         for c_idx, v in enumerate(row_data, start=1):
             ws.cell(row=excel_row, column=c_idx, value=v)
 
-    # B2：价税合计列求和（列G）
+    # B2：价税合计列求和（列L）
     if report_rows:
         last_row = data_start_row + len(report_rows) - 1
-        ws["B2"] = f"=SUM(G{data_start_row}:G{last_row})"
+        ws["B2"] = f"=SUM(L{data_start_row}:L{last_row})"
     else:
         ws["B2"] = 0
 
@@ -1161,20 +1213,29 @@ def _dataframe_to_excel_bytes(
     col_widths = {
         1: 16,  # 电商系统物料编码
         2: 16,  # 辅助自由项编码1
-        3: 12,
+        3: 16,  # 辅助自由项编码2
         4: 12,
-        5: 10,
-        6: 8,
-        7: 14,
-        8: 14,
+        5: 12,
+        6: 10,
+        7: 8,
+        8: 12,
         9: 12,
         10: 12,
         11: 12,
-        12: 10,
+        12: 14,
         13: 10,
-        14: 18,
-        15: 10,
-        16: 14,
+        14: 10,
+        15: 18,
+        16: 18,
+        17: 10,
+        18: 10,
+        19: 10,
+        20: 10,
+        21: 10,
+        22: 10,
+        23: 10,
+        24: 14,
+        25: 14,
     }
     for col_idx in range(1, len(body_headers) + 1):
         ws.column_dimensions[get_column_letter(col_idx)].width = col_widths.get(col_idx, 12)
