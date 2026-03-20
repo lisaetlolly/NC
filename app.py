@@ -210,21 +210,28 @@ def _enrich_so_df(
     so1_df = so1_df.copy()
     so2_df = so2_df.copy()
 
-    key1 = _first_existing_col(so1_df, ["出仓单号", "出仓单", "出库单号", "订单号", "订单编号"])
-    key2 = _first_existing_col(so2_df, ["外部单号", "外部订单号", "订单号", "单号"])
+    # 依据你的要求：双主键防止笛卡尔积膨胀
+    so2_ext_col = _first_existing_col(so2_df, ["外部单号", "外部订单号", "外部单号2", "单号"])
+    so2_sku_col = _first_existing_col(so2_df, ["货品", "商品编码", "SKU编码"])
+    so1_out_col = _first_existing_col(so1_df, ["出仓单号", "出仓单", "出库单号"])
+    so1_sku_code_col = _first_existing_col(so1_df, ["商品编码", "物料编码", "SKU编码", "电商系统物料编码"])
     oms_col = _first_existing_col(so2_df, ["OMS"])
 
-    if not key1 or not key2 or not oms_col:
+    if not so2_ext_col or not so2_sku_col or not so1_out_col or not so1_sku_code_col or not oms_col:
         if debug:
-            st.warning(f"SO无法定位合并键：key1={key1}, key2={key2}, oms_col={oms_col}")
+            st.warning(
+                f"SO无法定位双键：so2_ext={so2_ext_col}, so2_sku={so2_sku_col}, so1_out={so1_out_col}, so1_sku={so1_sku_code_col}, oms_col={oms_col}"
+            )
         return pd.DataFrame()
 
-    # Pandas merge 在不同数据类型上可能触发问题，因此在合并前进行“强转+清理”。
-    so1_df[key1] = _violent_clean_key_series(so1_df[key1])
-    so2_df[key2] = _violent_clean_key_series(so2_df[key2])
+    # 强制清理四个 join key + OMS
+    so1_df[so1_out_col] = _violent_clean_key_series(so1_df[so1_out_col])
+    so1_df[so1_sku_code_col] = _violent_clean_key_series(so1_df[so1_sku_code_col])
+    so2_df[so2_ext_col] = _violent_clean_key_series(so2_df[so2_ext_col])
+    so2_df[so2_sku_col] = _violent_clean_key_series(so2_df[so2_sku_col])
     so2_df[oms_col] = _violent_clean_key_series(so2_df[oms_col])
 
-    # 仅聚水潭发货明细（宽容：contains）
+    # 仅聚水潭发货明细
     so2_filt = so2_df.loc[so2_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
     if debug:
         st.write(f"👉 识别到底表1(聚水潭出库)，总行数: {len(so1_df)}")
@@ -233,44 +240,20 @@ def _enrich_so_df(
     if so2_filt.empty:
         return pd.DataFrame()
 
-    merged = so1_df.merge(
+    merged = pd.merge(
         so2_filt,
-        left_on=key1,
-        right_on=key2,
-        how="inner",
-        suffixes=("_底1", "_底2"),
+        so1_df,
+        how="left",
+        left_on=[so2_ext_col, so2_sku_col],
+        right_on=[so1_out_col, so1_sku_code_col],
+        suffixes=("_底2", "_底1"),
     )
+
+    # 去重防卫：避免 so1/so2 侧存在重复键导致行重复
+    merged = merged.drop_duplicates(subset=[so2_ext_col, so2_sku_col, so1_out_col, so1_sku_code_col])
+
     if debug:
-        st.write(f"👉 两表 Merge 匹配后，成功合并的行数: {len(merged)}")
-    if merged.empty:
-        if debug:
-            st.write("SO：merge后为空（inner join 找不到匹配单号），尝试归一化键二次匹配")
-
-        # 宽松匹配：用“提取数字+去前导0”的归一化键再 merge 一次
-        so1_tmp = so1_df.copy()
-        so2_tmp = so2_filt.copy()
-        so1_tmp["__SOKeyNorm__"] = so1_tmp[key1].map(_normalize_merge_key)
-        so2_tmp["__SOKeyNorm__"] = so2_tmp[key2].map(_normalize_merge_key)
-
-        so1_tmp = so1_tmp.loc[so1_tmp["__SOKeyNorm__"] != ""].copy()
-        so2_tmp = so2_tmp.loc[so2_tmp["__SOKeyNorm__"] != ""].copy()
-
-        if debug:
-            inter = set(so1_tmp["__SOKeyNorm__"].unique()) & set(so2_tmp["__SOKeyNorm__"].unique())
-            st.write(f"SO：归一化键交集数量={len(inter)}")
-
-        merged2 = so1_tmp.merge(
-            so2_tmp,
-            left_on="__SOKeyNorm__",
-            right_on="__SOKeyNorm__",
-            how="inner",
-            suffixes=("_底1", "_底2"),
-        )
-        if merged2.empty:
-            if debug:
-                st.write("SO：归一化 merge 仍为空")
-            return pd.DataFrame()
-        merged = merged2
+        st.write(f"👉 两表 Merge 匹配后（双键防膨胀），成功合并的行数: {len(merged)}")
 
     # 必备字段猜测
     # RT：强力候选数量/金额字段（不同模板可能叫法不同）
@@ -305,7 +288,7 @@ def _enrich_so_df(
     sku_name_col = _first_existing_col(merged, ["商品简称", "商品名称", "商品描述"])
     sku_code_col = _first_existing_col(merged, ["商品编码", "物料编码", "SKU编码", "电商系统物料编码"])
     shop_col = _first_existing_col(merged, ["店铺", "店铺名称", "平台店铺"])
-    order_col = key1
+    order_col = so1_out_col
     online_order_col = _first_existing_col(merged, ["线上订单号", "客户订单号", "线上订单", "订单号线上"])
 
     if not qty_col or not amount_col:
@@ -600,6 +583,228 @@ def _enrich_rt_df(
     return main_df, nonbao_df
 
 
+def _enrich_rt_df_v2(
+    rt3_df: pd.DataFrame,
+    rt4_df: pd.DataFrame,
+    aux_map: Dict[str, Tuple[str, str]],
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    RT 强化版：
+    - 用 WMS TH 清洗后的外部单号 left join 聚水潭售后单号
+    - 对未匹配行，再用 WMS 外部单号匹配聚水潭 线上订单号/内部订单号
+    - 金额/数量字段按要求优先级取值，并在输出阶段全部转为负数
+    """
+    rt3_df = _normalize_columns(rt3_df)
+    rt4_df = _normalize_columns(rt4_df)
+
+    oms_col = _first_existing_col(rt4_df, ["OMS"])
+    wms_external_col = _first_existing_col(rt4_df, ["外部单号", "外部订单号", "外部单号2", "单号"])
+    rt3_sa_after_col = _first_existing_col(rt3_df, ["售后单号", "售后订单号", "单号"])
+
+    if not oms_col or not wms_external_col or not rt3_sa_after_col:
+        if debug:
+            st.warning(f"RT_v2无法定位合并键：oms={oms_col}, wms_ext={wms_external_col}, rt3_after={rt3_sa_after_col}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # 取数量/金额字段（按你的优先级）
+    wms_qty_col = _first_existing_col(rt4_df, ["收货数量", "退货数量", "数量"])
+    wms_amount_col = _first_existing_col(rt4_df, ["退货金额", "实际入库金额", "线上申请金额", "金额", "退款金额", "实退金额"])
+    wms_ship_fee_col = _first_existing_col(rt4_df, ["运费金额", "运费"])
+
+    # 商品编码优先用 WMS 的货品列
+    wms_sku_col = _first_existing_col(rt4_df, ["货品", "商品编码", "物料编码", "SKU编码", "电商系统物料编码"])
+
+    # 退货表排除关键词用尽可能接近的列
+    wms_sku_name_col = _first_existing_col(rt4_df, ["货品名称", "商品名称", "商品简称", "商品描述", "货品"])
+
+    # 聚水潭侧用于输出店铺/线上订单号/内部订单号
+    rt3_shop_col = _first_existing_col(rt3_df, ["店铺", "店铺名称", "平台店铺"])
+    rt3_online_col = _first_existing_col(rt3_df, ["线上订单号", "线上订单", "客户订单号", "订单号线上", "线上订单编号"])
+    rt3_internal_col = _first_existing_col(rt3_df, ["内部订单号", "内部订单", "内部订单编号"])
+
+    missing_required = []
+    if not wms_qty_col:
+        missing_required.append("收货数量/退货数量")
+    if not wms_amount_col:
+        missing_required.append("退货金额/实际入库金额/线上申请金额")
+    if not wms_sku_col:
+        missing_required.append("货品/商品编码")
+    if missing_required:
+        if debug:
+            st.warning(f"RT_v2缺少必要字段：{missing_required}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    # 强制清理关键列
+    rt4_df[wms_external_col] = _violent_clean_key_series(rt4_df[wms_external_col])
+    rt4_df[oms_col] = _violent_clean_key_series(rt4_df[oms_col])
+    rt3_df[rt3_sa_after_col] = _violent_clean_key_series(rt3_df[rt3_sa_after_col])
+    if rt3_online_col:
+        rt3_df[rt3_online_col] = _violent_clean_key_series(rt3_df[rt3_online_col])
+    if rt3_internal_col:
+        rt3_df[rt3_internal_col] = _violent_clean_key_series(rt3_df[rt3_internal_col])
+    if rt3_shop_col:
+        rt3_df[rt3_shop_col] = _violent_clean_key_series(rt3_df[rt3_shop_col])
+
+    # OMS过滤
+    rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
+    if rt4_filt.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    rt4_filt["__WMSExternalNorm__"] = rt4_filt[wms_external_col]
+    rt4_filt["__WMSKeyTH__"] = rt4_filt[wms_external_col].apply(_clean_th_key)
+    rt4_filt["__WMSKeyTH__"] = _violent_clean_key_series(rt4_filt["__WMSKeyTH__"])
+    if debug:
+        st.write(f"👉 识别到底表3(聚水潭退货)，总行数: {len(rt3_df)}")
+        st.write(f"👉 识别到底表4(WMS收货)，总行数: {len(rt4_df)}")
+        st.write(f"👉 底表4 过滤聚水潭后，剩余行数: {len(rt4_filt)}")
+        st.write(f"👉 THKey!=空后 rows={(rt4_filt['__WMSKeyTH__']!='').sum()}")
+
+    # 退货输出需要 THKey 参与 join，但不匹配也要保留行
+    rt4_filt["__RT4_ID__"] = range(len(rt4_filt))
+
+    # 第一步：THKey -> 售后单号（left join 保留全部）
+    merged1 = pd.merge(
+        rt4_filt,
+        rt3_df,
+        how="left",
+        left_on="__WMSKeyTH__",
+        right_on=rt3_sa_after_col,
+        suffixes=("_wms", "_rt3"),
+    )
+
+    matched1_mask = merged1[rt3_sa_after_col].notna() & (merged1[rt3_sa_after_col] != "")
+    matched1 = merged1.loc[matched1_mask].copy()
+    unmatched1 = merged1.loc[~matched1_mask].copy()
+    if debug:
+        st.write(f"RT_v2：step1 left join 匹配行数={len(matched1)}，未匹配行数={len(unmatched1)}")
+
+    # 未匹配部分：再用 WMS 外部单号 -> 线上订单号/内部订单号
+    # 为了避免重复字段冲突，unmatched部分只取 WMS 侧列
+    wms_cols = list(rt4_filt.columns)
+    wms_unmatched = unmatched1[wms_cols].copy()
+
+    merged2_online = pd.DataFrame()
+    merged3_internal = pd.DataFrame()
+    remaining2 = wms_unmatched
+
+    if rt3_online_col:
+        tmp_online = pd.merge(
+            wms_unmatched,
+            rt3_df,
+            how="left",
+            left_on="__WMSExternalNorm__",
+            right_on=rt3_online_col,
+            suffixes=("_wms", "_rt3"),
+        )
+        matched_online_mask = tmp_online[rt3_online_col].notna() & (tmp_online[rt3_online_col] != "")
+        merged2_online = tmp_online.loc[matched_online_mask].copy()
+        remaining2 = tmp_online.loc[~matched_online_mask].copy()
+        if debug:
+            st.write(f"RT_v2：step2 线上订单号匹配行数={len(merged2_online)}，剩余未匹配={len(remaining2)}")
+
+    if rt3_internal_col:
+        # 对剩余未匹配再用内部订单号
+        remaining2_wms = remaining2[wms_cols].copy() if set(wms_cols).issubset(set(remaining2.columns)) else remaining2.copy()
+        tmp_internal = pd.merge(
+            remaining2_wms,
+            rt3_df,
+            how="left",
+            left_on="__WMSExternalNorm__",
+            right_on=rt3_internal_col,
+            suffixes=("_wms", "_rt3"),
+        )
+        matched_internal_mask = tmp_internal[rt3_internal_col].notna() & (tmp_internal[rt3_internal_col] != "")
+        merged3_internal = tmp_internal.loc[matched_internal_mask].copy()
+        remaining2 = tmp_internal.loc[~matched_internal_mask].copy()
+        if debug:
+            st.write(f"RT_v2：step2 内部订单号匹配行数={len(merged3_internal)}，最终未匹配={len(remaining2)}")
+
+    # concat：保留所有行（含最终未匹配）
+    frames = [matched1]
+    if not merged2_online.empty:
+        frames.append(merged2_online)
+    if not merged3_internal.empty:
+        frames.append(merged3_internal)
+    # remaining2 现在要保证是 merged 形态（已经包含rt3列，或仅wms列均可）
+    frames.append(remaining2)
+    merged_rt = pd.concat(frames, ignore_index=True)
+
+    # 去重防卫（避免 join 回填引入重复行）
+    merged_rt = merged_rt.drop_duplicates(subset=["__RT4_ID__", wms_sku_col], keep="first")
+    if debug:
+        st.write(f"👉 两表 Merge 匹配后，成功合并的行数: {len(merged_rt)}")
+
+    # 剔除商品关键词（如果列存在）
+    if wms_sku_name_col and wms_sku_name_col in merged_rt.columns:
+        merged_rt = merged_rt.loc[~_contains_keyword(merged_rt[wms_sku_name_col], SO_EXCLUDE_KEYWORDS)].copy()
+
+    # 数值字段强制转换（NaN -> 0）
+    qty_pos = pd.to_numeric(merged_rt[wms_qty_col], errors="coerce").fillna(0)
+    amt_pos = pd.to_numeric(merged_rt[wms_amount_col], errors="coerce").fillna(0)
+
+    # 退货表缺失 运费收入分摊 时当作 0：价税合计 = 金额 - 0
+    actual_pay_pos = amt_pos
+
+    # 退货输出前转负数：数量、金额都 * -1
+    qty_out = -qty_pos
+    pay_out = -actual_pay_pos
+
+    # 构建基础输出
+    shop_out = merged_rt[rt3_shop_col] if rt3_shop_col and rt3_shop_col in merged_rt.columns else "N/A"
+    online_out = merged_rt[rt3_online_col] if rt3_online_col and rt3_online_col in merged_rt.columns else ""
+
+    base_out = pd.DataFrame(
+        {
+            "店铺": shop_out,
+            "商品编码": merged_rt[wms_sku_col],
+            "实发数量": qty_out,
+            "实际支付金额": pay_out,
+            "线上订单号": online_out,
+            "订单号": merged_rt.get(rt3_sa_after_col, ""),
+        }
+    )
+
+    # 运费H101切分（如果WMS提供运费金额列）
+    if wms_ship_fee_col and wms_ship_fee_col in merged_rt.columns:
+        ship_fee_pos = pd.to_numeric(merged_rt[wms_ship_fee_col], errors="coerce").fillna(0)
+        fee_mask = ship_fee_pos > 0
+        if fee_mask.any():
+            fee_rows = merged_rt.loc[fee_mask].copy()
+            fee_shop = fee_rows[rt3_shop_col] if rt3_shop_col and rt3_shop_col in fee_rows.columns else "N/A"
+            fee_online = fee_rows[rt3_online_col] if rt3_online_col and rt3_online_col in fee_rows.columns else ""
+            fee_out = pd.DataFrame(
+                {
+                    "店铺": fee_shop,
+                    "商品编码": ["H101"] * len(fee_rows),
+                    "实发数量": [-1.0] * len(fee_rows),
+                    "实际支付金额": (-ship_fee_pos.loc[fee_mask]).values,
+                    "线上订单号": fee_online,
+                    "订单号": fee_rows.get(rt3_sa_after_col, ""),
+                }
+            )
+            base_out = pd.concat([base_out, fee_out], ignore_index=True)
+
+    # 按负数后的实发数量拆分
+    nonbao_df = base_out.loc[base_out["实发数量"] == 0].copy()
+    main_df = base_out.loc[base_out["实发数量"] != 0].copy()
+
+    # 输出前补齐 NaN：字符串为空，数值为0
+    for col in ["店铺", "商品编码", "线上订单号", "订单号"]:
+        if col in main_df.columns:
+            main_df[col] = main_df[col].fillna("").astype(str)
+        if col in nonbao_df.columns:
+            nonbao_df[col] = nonbao_df[col].fillna("").astype(str)
+
+    for col in ["实发数量", "实际支付金额"]:
+        if col in main_df.columns:
+            main_df[col] = pd.to_numeric(main_df[col], errors="coerce").fillna(0)
+        if col in nonbao_df.columns:
+            nonbao_df[col] = pd.to_numeric(nonbao_df[col], errors="coerce").fillna(0)
+
+    return main_df, nonbao_df
+
+
 def _compute_report_rows(
     df: pd.DataFrame,
     aux_map: Dict[str, Tuple[str, str]],
@@ -628,9 +833,8 @@ def _compute_report_rows(
     qty = pd.to_numeric(df["实发数量"], errors="coerce").fillna(0)
     price = pd.to_numeric(df["实际支付金额"], errors="coerce").fillna(0)
 
-    if is_return:
-        qty = -qty
-        price = -price
+    # is_return 仅用于标识输出口径；正负号由上游数据逻辑控制
+    # （SO为正，RT在 _enrich_rt_df 中已转换为负数）
 
     ex_tax = (price / 1.13).round(2)
     tax = (price - ex_tax).round(2)
@@ -701,6 +905,17 @@ def _dataframe_to_excel_bytes(
     aux_map: Dict[str, Tuple[str, str]],
     is_return: bool,
 ) -> BytesIO:
+    if df is None:
+        df = pd.DataFrame()
+    df = df.copy()
+    # 输出前统一 NaN 处理：字符串列为空，数值列为0
+    for col in ["店铺", "商品编码", "线上订单号", "订单号"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").astype(str)
+    for col in ["实发数量", "实际支付金额"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0)
+
     yesterday_slash = yesterday.strftime("%Y/%m/%d")
     yesterday_ymd = yesterday.strftime("%Y%m%d")
 
@@ -1036,7 +1251,7 @@ def main() -> None:
         rt_main_df = pd.DataFrame()
         rt_nonbao_df = pd.DataFrame()
         if rt3_df is not None and rt4_df is not None:
-            rt_main_df, rt_nonbao_df = _enrich_rt_df(rt3_df, rt4_df, aux_map=aux_map, debug=debug)
+            rt_main_df, rt_nonbao_df = _enrich_rt_df_v2(rt3_df, rt4_df, aux_map=aux_map, debug=debug)
         st.write(f"RT主退货行数：{len(rt_main_df) if rt_main_df is not None else 0}，RT非保行数：{len(rt_nonbao_df) if rt_nonbao_df is not None else 0}")
 
         # 手工单：尽量按“同格式处理（SO正 RT负）”
@@ -1094,10 +1309,9 @@ def main() -> None:
                     manual_so_df["实发数量"] = pd.to_numeric(manual_so_df["实发数量"], errors="coerce").fillna(0).abs()
                     manual_so_df["实际支付金额"] = pd.to_numeric(manual_so_df["实际支付金额"], errors="coerce").fillna(0).abs()
                 if not manual_rt_df.empty:
-                    # 注意：报表生成层（is_return=True）会再做一次 * -1
-                    # 因此这里把退货保留为正数的“绝对值”，让报表层统一输出负数
-                    manual_rt_df["实发数量"] = pd.to_numeric(manual_rt_df["实发数量"], errors="coerce").fillna(0).abs()
-                    manual_rt_df["实际支付金额"] = pd.to_numeric(manual_rt_df["实际支付金额"], errors="coerce").fillna(0).abs()
+                    # 退货按要求转为负数：数量/金额都 * -1
+                    manual_rt_df["实发数量"] = -pd.to_numeric(manual_rt_df["实发数量"], errors="coerce").fillna(0).abs()
+                    manual_rt_df["实际支付金额"] = -pd.to_numeric(manual_rt_df["实际支付金额"], errors="coerce").fillna(0).abs()
 
                 manual_so_df = manual_so_df[["店铺", "商品编码", "实发数量", "实际支付金额", "线上订单号", "订单号"]].copy()
                 manual_rt_df = manual_rt_df[["店铺", "商品编码", "实发数量", "实际支付金额", "线上订单号", "订单号"]].copy()
