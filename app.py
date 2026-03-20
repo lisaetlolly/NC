@@ -172,6 +172,11 @@ def _enrich_so_df(
     if not key1 or not key2 or not oms_col:
         return pd.DataFrame()
 
+    # Pandas merge 在不同数据类型（object/int/float）上可能触发 ValueError，
+    # 因此在合并前将 join key 统一转为“去空格字符串”。
+    so1_df[key1] = so1_df[key1].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
+    so2_df[key2] = so2_df[key2].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
+
     # 仅聚水潭发货明细
     so2_filt = so2_df.loc[so2_df[oms_col].astype(str) == "聚水潭"].copy()
     if so2_filt.empty:
@@ -313,6 +318,10 @@ def _enrich_rt_df(
 
     if not oms_col or not external_key or not after_key:
         return pd.DataFrame(), pd.DataFrame()
+
+    # 同样对 join key 做类型统一（字符串），避免 merge key dtype 不兼容导致 ValueError
+    rt3_df[after_key] = rt3_df[after_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
+    rt4_df[external_key] = rt4_df[external_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
 
     rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str) == "聚水潭"].copy()
     if rt4_filt.empty:
