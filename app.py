@@ -583,6 +583,135 @@ def _enrich_rt_df(
     return main_df, nonbao_df
 
 
+def _enrich_rt_df_strict(
+    rt3_df: pd.DataFrame,
+    rt4_df: pd.DataFrame,
+    debug: bool = False,
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    RT严格模式（按你的文档字段标准，不再对“金额/数量列”做兜底猜测）：
+    - 金额：来自底表3 `卖家应退金额`
+    - 数量：来自底表4 `收货数量`
+    - 匹配键：底表4 `外部单号` 去掉 TH 后取前11位数字 -> 底表3 `售后单号`
+    """
+    # 额外兜底：再次清理表头空格（你在 main 已经做了立即清理）
+    rt3_df.columns = rt3_df.columns.astype(str).str.strip()
+    rt4_df.columns = rt4_df.columns.astype(str).str.strip()
+
+    after_key_col = "售后单号"
+    rt3_amount_col = "卖家应退金额"
+    rt4_external_col = "外部单号"
+    rt4_qty_col = "收货数量"
+
+    missing = []
+    for c in [after_key_col, rt3_amount_col]:
+        if c not in rt3_df.columns:
+            missing.append(f"底表3缺列:{c}")
+    for c in [rt4_external_col, rt4_qty_col]:
+        if c not in rt4_df.columns:
+            missing.append(f"底表4缺列:{c}")
+
+    if missing:
+        if debug:
+            st.warning("RT严格模式：必需字段缺失：" + "；".join(missing))
+            st.write(f"底表3列名样本：{list(rt3_df.columns[:40])}")
+            st.write(f"底表4列名样本：{list(rt4_df.columns[:40])}")
+        return pd.DataFrame(), pd.DataFrame()
+
+    oms_col = _first_existing_col(rt4_df, ["OMS"])
+    if not oms_col:
+        if debug:
+            st.warning("RT严格模式：底表4缺少 OMS 列，无法过滤聚水潭")
+        return pd.DataFrame(), pd.DataFrame()
+
+    if debug:
+        st.write(f"👉 识别到底表3(聚水潭退货)，总行数: {len(rt3_df)}")
+        st.write(f"👉 识别到底表4(WMS收货)，总行数: {len(rt4_df)}")
+
+    rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
+    if rt4_filt.empty:
+        return pd.DataFrame(), pd.DataFrame()
+
+    # 按要求：匹配前统一类型：astype(str).str.strip().str.replace(r'\\.0$', '', regex=True)
+    rt3_df["__after_norm__"] = (
+        rt3_df[after_key_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+    rt4_filt["__ext_norm__"] = (
+        rt4_filt[rt4_external_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True)
+    )
+
+    # TH 转换：去掉 TH 后，保留前 11 位数字
+    no_th = rt4_filt["__ext_norm__"].str.replace(r"(?i)th", "", regex=True)
+    digits_only = no_th.str.replace(r"\D+", "", regex=True)
+    rt4_filt["__THKey__"] = digits_only.str.slice(0, 11)
+
+    if debug:
+        st.write(f"👉 底表4 过滤聚水潭后，剩余行数: {len(rt4_filt)}")
+        st.write(f"👉 THKey!=空后 rows={(rt4_filt['__THKey__']!='').sum()}")
+
+    rt4_filt["__RT4_ID__"] = range(len(rt4_filt))
+
+    # Merge：底表4 THKey -> 底表3 售后单号
+    rt_merged = pd.merge(
+        rt4_filt,
+        rt3_df,
+        how="left",
+        left_on="__THKey__",
+        right_on="__after_norm__",
+        suffixes=("_wms", "_rt3"),
+    )
+
+    if debug:
+        st.write(f"👉 两表 Merge 匹配后，成功合并的行数: {len(rt_merged)}")
+
+    # 固定列硬抓：不再猜列名（按你要求）
+    rt_merged["__amt__"] = pd.to_numeric(rt_merged[rt3_amount_col], errors="coerce").fillna(0.0)
+    rt_merged["__qty__"] = pd.to_numeric(rt_merged[rt4_qty_col], errors="coerce").fillna(0.0)
+
+    # 金额/数量统统乘 -1 转为负数
+    rt_merged["实发数量"] = -rt_merged["__qty__"]
+    rt_merged["实际支付金额"] = -rt_merged["__amt__"]
+
+    # 其它列用于报表输出（不影响金额/数量的严格标准）
+    sku_code_col = _first_existing_col(rt4_df, ["货品", "商品编码", "物料编码", "SKU编码", "电商系统物料编码"])
+    sku_name_col = _first_existing_col(rt4_df, ["商品简称", "商品名称", "商品描述", "货品名称"])
+    shop_col = _first_existing_col(rt3_df, ["店铺", "店铺名称", "平台店铺"])
+    online_order_col = _first_existing_col(rt3_df, ["线上订单号", "线上订单", "客户订单号", "订单号线上", "线上订单编号"])
+
+    base_out = pd.DataFrame(
+        {
+            "店铺": rt_merged[shop_col] if shop_col and shop_col in rt_merged.columns else "N/A",
+            "商品编码": rt_merged[sku_code_col] if sku_code_col and sku_code_col in rt_merged.columns else "",
+            "实发数量": rt_merged["实发数量"],
+            "实际支付金额": rt_merged["实际支付金额"],
+            "线上订单号": rt_merged[online_order_col] if online_order_col and online_order_col in rt_merged.columns else "",
+            "订单号": rt_merged.get(after_key_col, ""),
+        }
+    )
+
+    if sku_name_col and sku_name_col in rt_merged.columns:
+        mask_exclude = _contains_keyword(rt_merged[sku_name_col], SO_EXCLUDE_KEYWORDS)
+        base_out = base_out.loc[~mask_exclude.values].copy()
+
+    nonbao_df = base_out.loc[base_out["实发数量"] == 0].copy()
+    main_df = base_out.loc[base_out["实发数量"] != 0].copy()
+
+    # 输出前补齐 NaN：字符串为空，数值为0（避免 Excel 写入 NaN）
+    for col in ["店铺", "商品编码", "线上订单号", "订单号"]:
+        if col in main_df.columns:
+            main_df[col] = main_df[col].fillna("").astype(str)
+        if col in nonbao_df.columns:
+            nonbao_df[col] = nonbao_df[col].fillna("").astype(str)
+
+    for col in ["实发数量", "实际支付金额"]:
+        if col in main_df.columns:
+            main_df[col] = pd.to_numeric(main_df[col], errors="coerce").fillna(0.0)
+        if col in nonbao_df.columns:
+            nonbao_df[col] = pd.to_numeric(nonbao_df[col], errors="coerce").fillna(0.0)
+
+    return main_df, nonbao_df
+
+
 def _enrich_rt_df_v2(
     rt3_df: pd.DataFrame,
     rt4_df: pd.DataFrame,
@@ -595,8 +724,7 @@ def _enrich_rt_df_v2(
     - 对未匹配行，再用 WMS 外部单号匹配聚水潭 线上订单号/内部订单号
     - 金额/数量字段按要求优先级取值，并在输出阶段全部转为负数
     """
-    rt3_df = _normalize_columns(rt3_df)
-    rt4_df = _normalize_columns(rt4_df)
+    return _enrich_rt_df_strict(rt3_df, rt4_df, debug=debug)
 
     oms_col = _first_existing_col(rt4_df, ["OMS"])
     wms_external_col = _first_existing_col(rt4_df, ["外部单号", "外部订单号", "外部单号2", "单号"])
@@ -1224,6 +1352,11 @@ def main() -> None:
             if rt4_files
             else None
         )
+        # RT字段匹配对“列名是否带不可见空格”极其敏感：按要求立即清理表头空格
+        if rt3_df is not None:
+            rt3_df.columns = rt3_df.columns.astype(str).str.strip()
+        if rt4_df is not None:
+            rt4_df.columns = rt4_df.columns.astype(str).str.strip()
         manual_df = (
             _dfs_to_concat_by_name_keywords(
                 manual_files,
