@@ -177,8 +177,8 @@ def _enrich_so_df(
     so1_df[key1] = so1_df[key1].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
     so2_df[key2] = so2_df[key2].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
 
-    # 仅聚水潭发货明细
-    so2_filt = so2_df.loc[so2_df[oms_col].astype(str) == "聚水潭"].copy()
+    # 仅聚水潭发货明细（宽容：contains，避免不可见空格导致等号匹配为空）
+    so2_filt = so2_df.loc[so2_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
     if so2_filt.empty:
         return pd.DataFrame()
 
@@ -323,11 +323,12 @@ def _enrich_rt_df(
     rt3_df[after_key] = rt3_df[after_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
     rt4_df[external_key] = rt4_df[external_key].astype(str).str.strip().replace({"nan": "", "NaN": "", "None": ""})
 
-    rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str) == "聚水潭"].copy()
+    # 仅聚水潭收货明细（宽容：contains，避免不可见空格导致等号匹配为空）
+    rt4_filt = rt4_df.loc[rt4_df[oms_col].astype(str).str.contains("聚水潭", na=False)].copy()
     if rt4_filt.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    rt4_filt["__THKey__"] = rt4_filt[external_key].apply(_clean_th_key)
+    rt4_filt["__THKey__"] = rt4_filt[external_key].apply(_clean_th_key).astype(str).str.strip()
     rt4_filt = rt4_filt.loc[rt4_filt["__THKey__"] != ""].copy()
     if rt4_filt.empty:
         return pd.DataFrame(), pd.DataFrame()
@@ -644,6 +645,64 @@ def _dfs_to_concat(files: List[object], st_label: str) -> Optional[pd.DataFrame]
     return pd.concat(dfs, ignore_index=True)
 
 
+def _dfs_to_concat_by_name_keywords(
+    files: List[object],
+    st_label: str,
+    name_keywords: Optional[List[str]],
+) -> Optional[pd.DataFrame]:
+    """
+    按上传文件名宽容过滤读取（用于兜底识别文件）。
+    若过滤后为空，会自动回退到“不过滤”。
+    """
+    if not files:
+        return None
+
+    name_keywords = name_keywords or []
+    lowered_keywords = [k.lower() for k in name_keywords if k]
+
+    def _match_one(f: object) -> bool:
+        if not lowered_keywords:
+            return True
+        nm = str(getattr(f, "name", "") or "").lower()
+        return any(k in nm for k in lowered_keywords)
+
+    dfs: List[pd.DataFrame] = []
+    for f in files or []:
+        if not _match_one(f):
+            continue
+        try:
+            if hasattr(f, "seek"):
+                f.seek(0)
+            df = pd.read_excel(f)
+            if df is None or df.empty:
+                continue
+            df = _normalize_columns(df)
+            dfs.append(df)
+        except Exception as e:
+            st.warning(f"{st_label}读取失败：{e}")
+
+    if dfs:
+        return pd.concat(dfs, ignore_index=True)
+
+    # 兜底：名字过滤导致空，回退到读取所有
+    dfs = []
+    for f in files or []:
+        try:
+            if hasattr(f, "seek"):
+                f.seek(0)
+            df = pd.read_excel(f)
+            if df is None or df.empty:
+                continue
+            df = _normalize_columns(df)
+            dfs.append(df)
+        except Exception as e:
+            st.warning(f"{st_label}读取失败：{e}")
+
+    if not dfs:
+        return None
+    return pd.concat(dfs, ignore_index=True)
+
+
 def _zip_bytes(files: Dict[str, BytesIO]) -> BytesIO:
     zbuf = BytesIO()
     with zipfile.ZipFile(zbuf, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -749,20 +808,63 @@ def main() -> None:
 
         st.write(f"辅助表：{0 if aux_df is None else len(aux_df)} 行")
 
-        so1_df = _dfs_to_concat(so1_files, "销售底表1") if so1_files else None
-        so2_df = _dfs_to_concat(so2_files, "销售底表2") if so2_files else None
-        rt3_df = _dfs_to_concat(rt3_files, "退货底表3") if rt3_files else None
-        rt4_df = _dfs_to_concat(rt4_files, "退货底表4") if rt4_files else None
-        manual_df = _dfs_to_concat(manual_files, "手工单表") if manual_files else None
+        # 宽容文件名识别（如果文件名不规范会自动回退为“不过滤”，避免整批空数据）
+        so1_df = (
+            _dfs_to_concat_by_name_keywords(
+                so1_files,
+                "销售底表1",
+                ["底表1", "销售出库", "出库表", "聚水潭出库"],
+            )
+            if so1_files
+            else None
+        )
+        so2_df = (
+            _dfs_to_concat_by_name_keywords(
+                so2_files,
+                "销售底表2",
+                ["底表2", "发货明细", "WMS发货", "发货", "WMS"],
+            )
+            if so2_files
+            else None
+        )
+        rt3_df = (
+            _dfs_to_concat_by_name_keywords(
+                rt3_files,
+                "退货底表3",
+                ["底表3", "退货", "售后", "聚水潭退货"],
+            )
+            if rt3_files
+            else None
+        )
+        rt4_df = (
+            _dfs_to_concat_by_name_keywords(
+                rt4_files,
+                "退货底表4",
+                ["底表4", "收货明细", "WMS收货", "收货", "WMS"],
+            )
+            if rt4_files
+            else None
+        )
+        manual_df = (
+            _dfs_to_concat_by_name_keywords(
+                manual_files,
+                "手工单表",
+                ["手工", "手工单", "独立业务"],
+            )
+            if manual_files
+            else None
+        )
 
         so_base_df = pd.DataFrame()
         if so1_df is not None and so2_df is not None:
             so_base_df = _enrich_so_df(so1_df, so2_df, aux_map=aux_map)
+        st.write(f"SO匹配后行数：{len(so_base_df)}")
 
         rt_main_df = pd.DataFrame()
         rt_nonbao_df = pd.DataFrame()
         if rt3_df is not None and rt4_df is not None:
             rt_main_df, rt_nonbao_df = _enrich_rt_df(rt3_df, rt4_df, aux_map=aux_map)
+        st.write(f"RT主退货行数：{len(rt_main_df) if rt_main_df is not None else 0}，RT非保行数：{len(rt_nonbao_df) if rt_nonbao_df is not None else 0}")
 
         # 手工单：尽量按“同格式处理（SO正 RT负）”
         manual_so_df = pd.DataFrame()
